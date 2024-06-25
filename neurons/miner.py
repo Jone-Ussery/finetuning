@@ -27,7 +27,7 @@ import bittensor as bt
 import torch
 import wandb
 from dotenv import load_dotenv
-from transformers import PreTrainedModel
+from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, PreTrainedModel
 
 import constants
 import finetune as ft
@@ -143,7 +143,9 @@ async def main(config: bt.config):
     ft.mining.save(model, model_dir)
 
     # Build optimizer
+    num_warmup_steps = 0
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=0)
     wandb_run = None
 
     # If using wandb, start a new run.
@@ -219,6 +221,7 @@ async def main(config: bt.config):
                 if (i + 1) % accumulation_steps == 0:
                     n_acc_steps += 1
                     optimizer.step()  # Perform a single optimization step
+                    lr_scheduler.step()
                     optimizer.zero_grad()  # Clear gradients
                     bt.logging.success(
                         f"Step: {n_acc_steps} loss: {outputs.loss.detach().item()}"
