@@ -28,7 +28,7 @@ import torch
 import wandb
 from dotenv import load_dotenv
 from transformers import get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup, PreTrainedModel
-
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 import constants
 import finetune as ft
 from competitions import utils as competition_utils
@@ -90,6 +90,27 @@ async def load_starting_model(
     )
 
 
+def count_parameters(model: torch.nn.Module) -> typing.Tuple[int, int]:
+    r"""
+    Returns the number of trainable parameters and number of all parameters in the model.
+    """
+    trainable_params, all_param = 0, 0
+    for param in model.parameters():
+        num_params = param.numel()
+        # if using DS Zero 3 and the weights are initialized empty
+        if num_params == 0 and hasattr(param, "ds_numel"):
+            num_params = param.ds_numel
+
+        # Due to the design of 4bit linear layers from bitsandbytes, multiply the number of parameters by 2
+        if param.__class__.__name__ == "Params4bit":
+            num_params = num_params * 2
+
+        all_param += num_params
+        if param.requires_grad:
+            trainable_params += num_params
+
+    return trainable_params, all_param
+
 async def main(config: bt.config):
     # Create bittensor objects.
     bt.logging(config=config)
@@ -136,7 +157,34 @@ async def main(config: bt.config):
     # Init model.
     tokenizer = ft.model.load_tokenizer(competition, cache_dir=config.model_dir)
     model = await load_starting_model(config, metagraph, chain_metadata_store, kwargs)
+    if config.use_lora:
+        bt.logging.success("Fine-tuning method: LoRA")
+        peft_kwargs = {
+            "r": config.lora_rank,
+            "target_modules": ['down_proj', 'q_proj', 'o_proj', 'v_proj', 'up_proj', 'k_proj', 'gate_proj'],
+            "lora_alpha": config.lora_alpha,
+            "lora_dropout": config.lora_dropout,
+        }
+        lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                **peft_kwargs,
+            )
+        
+        model = get_peft_model(model, lora_config)
+        
+        for param in filter(lambda p: p.requires_grad, model.parameters()):
+            param.data = param.data.to(torch.bfloat16)
+
     model = model.train()
+    
+    trainable_params, all_param = count_parameters(model)
+    bt.logging.success(
+        "trainable params: {:d} || all params: {:d} || trainable%: {:.4f}".format(
+            trainable_params, all_param, 100 * trainable_params / all_param
+        )
+    )
+
     model = model.to(config.device)
 
     bt.logging.success(f"Saving model to path: {model_dir}.")
