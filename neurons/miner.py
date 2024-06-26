@@ -157,7 +157,7 @@ async def main(config: bt.config):
     # Init model.
     tokenizer = ft.model.load_tokenizer(competition, cache_dir=config.model_dir)
     model = await load_starting_model(config, metagraph, chain_metadata_store, kwargs)
-    if config.use_lora:
+    if config.finetuning_type == "lora":
         bt.logging.success("Fine-tuning method: LoRA")
         peft_kwargs = {
             "r": config.lora_rank,
@@ -168,6 +168,7 @@ async def main(config: bt.config):
         lora_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 inference_mode=False,
+                modules_to_save=config.additional_target,
                 **peft_kwargs,
             )
         

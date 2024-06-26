@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import Literal, Optional, Any, Dict
 
 import bittensor as bt
 import torch
@@ -200,6 +201,35 @@ def miner_config():
         help="datatype to load model in, either bfloat16 or float16",
     )
     parser.add_argument(
+        "--finetuning_type",
+        type=Optional[Literal["lora", "freeze", "full"]],
+        help="Which fine-tuning method to use.",
+    )
+    parser.add_argument(
+        "--additional_target",
+        type=str,
+        default=None,
+        help="Name(s) of modules apart from LoRA layers to be set as trainable and saved in the final checkpoint.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=None,
+        help="The scale factor for LoRA fine-tuning (default: lora_rank * 2).",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=8,
+        help="The intrinsic dimension for LoRA fine-tuning.",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout rate for the LoRA fine-tuning.",
+    )
+    parser.add_argument(
         "--competition_id",
         type=CompetitionId,
         default=CompetitionId.SN9_MODEL.value,
@@ -210,6 +240,11 @@ def miner_config():
         "--list_competitions", action="store_true", help="Print out all competitions"
     )
 
+    def split_arg(arg):
+        if isinstance(arg, str):
+            return [item.strip() for item in arg.split(",")]
+        return arg
+    
     # Include wallet and logging arguments from bittensor
     bt.wallet.add_args(parser)
     bt.subtensor.add_args(parser)
@@ -217,5 +252,7 @@ def miner_config():
 
     # Parse the arguments and create a configuration namespace
     config = bt.config(parser)
-
+    config.lora_alpha = config.lora_alpha or config.lora_rank * 2
+    config.additional_target = split_arg(config.additional_target)
+    assert config.finetuning_type in ["lora", "freeze", "full"], "Invalid fine-tuning method."
     return config
