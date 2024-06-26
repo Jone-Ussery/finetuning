@@ -202,7 +202,7 @@ def miner_config():
     )
     parser.add_argument(
         "--finetuning_type",
-        type=Optional[Literal["lora", "freeze", "full"]],
+        type=str,
         help="Which fine-tuning method to use.",
     )
     parser.add_argument(
