@@ -13,6 +13,14 @@ from model.storage.remote_model_store import RemoteModelStore
 from model.utils import get_hash_of_two_strings
 
 
+class MinerMisconfiguredError(Exception):
+    """Error raised when a miner is misconfigured."""
+
+    def __init__(self, hotkey: str, message: str):
+        self.hotkey = hotkey
+        super().__init__(f"[{hotkey}] {message}")
+
+
 class ModelUpdater:
     """Checks if the currently tracked model for a hotkey matches what the miner committed to the chain."""
 
@@ -30,18 +38,20 @@ class ModelUpdater:
 
     @staticmethod
     def verify_model_satisfies_parameters(model: Model) -> bool:
-        competition = competition_utils.get_competition(model.id.competition_id)
-        if not competition:
+        model_constraints = competition_utils.get_model_constraints(
+            model.id.competition_id
+        )
+        if not model_constraints:
             bt.logging.trace(f"No competition found for {model.id.competition_id}")
             return False
 
         # Check that the parameter count of the model is within allowed bounds.
         parameter_size = sum(p.numel() for p in model.pt_model.parameters())
-        if parameter_size > competition.constraints.max_model_parameter_size:
+        if parameter_size > model_constraints.max_model_parameter_size:
             return False
 
         # Make sure it's an allowed architecture.
-        if type(model.pt_model) not in competition.constraints.allowed_architectures:
+        if type(model.pt_model) not in model_constraints.allowed_architectures:
             return False
 
         # Check parameters are sane
@@ -56,28 +66,43 @@ class ModelUpdater:
         """Get metadata about a model by hotkey"""
         return await self.metadata_store.retrieve_model_metadata(hotkey)
 
-    async def sync_model(self, hotkey: str, force: bool = False) -> bool:
+    async def sync_model(
+        self, hotkey: str, curr_block: int, force: bool = False
+    ) -> bool:
         """Updates local model for a hotkey if out of sync and returns if it was updated."
 
         Args:
            hotkey (str): The hotkey of the model to sync.
+           curr_block (int): The current block.
            force (bool): Whether to force a sync for this model, even if it's chain metadata hasn't changed.
         """
         # Get the metadata for the miner.
         metadata = await self._get_metadata(hotkey)
 
         if not metadata:
-            bt.logging.trace(
-                f"No valid metadata found on the chain for hotkey {hotkey}"
-            )
-            raise ValueError(
-                f"No valid metadata found on the chain for hotkey {hotkey}"
+            raise MinerMisconfiguredError(
+                hotkey, f"No valid metadata found on the chain"
             )
 
-        competition = competition_utils.get_competition(metadata.id.competition_id)
+        # Check that the metadata indicates a competition available at time of upload.
+        competition = competition_utils.get_competition_for_block(
+            metadata.id.competition_id, metadata.block
+        )
         if not competition:
-            bt.logging.trace(f"No competition found for {metadata.id.competition_id}")
-            raise ValueError(f"No competition found for {metadata.id.competition_id}")
+            raise MinerMisconfiguredError(
+                hotkey,
+                f"No competition found for {metadata.id.competition_id} at block {metadata.block}",
+            )
+
+        # Check that the metadata is old enough to meet the eval_block_delay for the competition.
+        # If not we return false and will check again next time we go through the update loop.
+        if curr_block - metadata.block < competition.constraints.eval_block_delay:
+            bt.logging.debug(
+                f"""Sync for hotkey {hotkey} delayed as the current block: {curr_block} is not at least 
+                {competition.constraints.eval_block_delay} blocks after the upload block: {metadata.block}. 
+                Will automatically retry later."""
+            )
+            return False
 
         # Check what model id the model tracker currently has for this hotkey.
         tracker_model_metadata = self.model_tracker.get_model_metadata_for_miner_hotkey(
@@ -91,7 +116,9 @@ class ModelUpdater:
         path = self.local_store.get_path(hotkey)
 
         # Otherwise we need to download the new model based on the metadata.
-        model = await self.remote_store.download_model(metadata.id, path, competition)
+        model = await self.remote_store.download_model(
+            metadata.id, path, competition.constraints
+        )
 
         # Update the tracker even if the model fails the following checks to avoid redownloading without new metadata.
         self.model_tracker.on_miner_model_updated(hotkey, metadata)
@@ -99,16 +126,15 @@ class ModelUpdater:
         # Check that the hash of the downloaded content matches.
         secure_hash = get_hash_of_two_strings(model.id.hash, hotkey)
         if secure_hash != metadata.id.secure_hash:
-            bt.logging.trace(
-                f"Sync for hotkey {hotkey} failed. Hashes do not match of content: {secure_hash} != {metadata.id.secure_hash}."
-            )
-            raise ValueError(
-                f"Sync for hotkey {hotkey} failed. Hash of content downloaded from hugging face does not match chain metadata. {metadata}"
+            raise MinerMisconfiguredError(
+                hotkey,
+                f"Hash of content downloaded from hugging face does not match chain metadata. {metadata}",
             )
 
         if not ModelUpdater.verify_model_satisfies_parameters(model):
-            raise ValueError(
-                f"Sync for hotkey {hotkey} failed, model does not satisfy parameters for competition {competition.id}"
+            raise MinerMisconfiguredError(
+                hotkey,
+                f"Model does not satisfy parameters for competition {competition.id}",
             )
 
         return True

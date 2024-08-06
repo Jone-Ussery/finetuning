@@ -44,8 +44,9 @@ import constants
 import finetune as ft
 from competitions.competition_tracker import CompetitionTracker
 from competitions.data import CompetitionId
+from competitions import utils as competition_utils
 from model.model_tracker import ModelTracker
-from model.model_updater import ModelUpdater
+from model.model_updater import MinerMisconfiguredError, ModelUpdater
 from model.storage.chain.chain_model_metadata_store import ChainModelMetadataStore
 from model.storage.disk.disk_model_store import DiskModelStore
 from model.storage.hugging_face.hugging_face_model_store import HuggingFaceModelStore
@@ -354,6 +355,8 @@ class Validator:
                     > constants.chain_update_cadence
                 ):
                     last_checked_top_models_time = dt.datetime.now()
+                    # Take a deep copy of the metagraph for use in the top uid retry check.
+                    # The regular loop below will use self.metagraph which may be updated as we go.
                     with self.metagraph_lock:
                         metagraph = copy.deepcopy(self.metagraph)
 
@@ -389,31 +392,35 @@ class Validator:
                             try:
                                 uid_last_retried_evaluation[uid] = dt.datetime.now()
 
-                                # Redownload this model and schedule it for eval even if it isn't updated by the sync.
+                                # Redownload this model and schedule it for eval even if it hasn't changed.
+                                # Still respect the eval block delay so that previously top uids can't bypass it.
                                 hotkey = metagraph.hotkeys[uid]
-                                asyncio.run(
-                                    self.model_updater.sync_model(hotkey, force=True)
+                                should_retry = self.model_updater.sync_model(
+                                    hotkey,
+                                    metagraph.block.item(),
+                                    force=True,
                                 )
 
-                                # Since this is a top model (as determined by other valis),
-                                # we don't worry if self.pending_uids is already "full".
-                                # Validators should only have ~1 winner per competition and we only check bigger valis
-                                # so there should not be many simultaneous top models not already being evaluated.
-                                top_model_metadata = self.model_tracker.get_model_metadata_for_miner_hotkey(
-                                    hotkey
-                                )
-                                if top_model_metadata is not None:
-                                    bt.logging.trace(
-                                        f"Shortcutting to top model or retrying evaluation for previously discarded top model with incentive for UID={uid}"
+                                if should_retry:
+                                    # Since this is a top model (as determined by other valis),
+                                    # we don't worry if self.pending_uids is already "full".
+                                    # Validators should only have ~1 winner per competition and we only check bigger valis
+                                    # so there should not be many simultaneous top models not already being evaluated.
+                                    top_model_metadata = self.model_tracker.get_model_metadata_for_miner_hotkey(
+                                        hotkey
                                     )
-                                    with self.pending_uids_to_eval_lock:
-                                        self.pending_uids_to_eval[
-                                            top_model_metadata.id.competition_id
-                                        ].add(uid)
-                                else:
-                                    bt.logging.warning(
-                                        f"Failed to find metadata for uid {uid} with hotkey {hotkey}"
-                                    )
+                                    if top_model_metadata is not None:
+                                        bt.logging.trace(
+                                            f"Shortcutting to top model or retrying evaluation for previously discarded top model with incentive for UID={uid}"
+                                        )
+                                        with self.pending_uids_to_eval_lock:
+                                            self.pending_uids_to_eval[
+                                                top_model_metadata.id.competition_id
+                                            ].add(uid)
+                                    else:
+                                        bt.logging.warning(
+                                            f"Failed to find metadata for uid {uid} with hotkey {hotkey}"
+                                        )
                             except Exception:
                                 bt.logging.debug(
                                     f"Failure in update loop for UID={uid} during top model check. {traceback.format_exc()}"
@@ -467,10 +474,11 @@ class Validator:
                 # Get their hotkey from the metagraph.
                 with self.metagraph_lock:
                     hotkey = self.metagraph.hotkeys[next_uid]
+                    curr_block = self.metagraph.block.item()
 
                 # Compare metadata and tracker, syncing new model from remote store to local if necessary.
                 updated = asyncio.run(
-                    self.model_updater.sync_model(hotkey, force=False)
+                    self.model_updater.sync_model(hotkey, curr_block, force=False)
                 )
 
                 if updated:
@@ -487,9 +495,11 @@ class Validator:
                             )
                     else:
                         bt.logging.warning(
-                            f"Failed to find metadata for uid {uid} with hotkey {hotkey}"
+                            f"Failed to find metadata for uid {next_uid} with hotkey {hotkey}"
                         )
 
+            except MinerMisconfiguredError as e:
+                bt.logging.trace(e)
             except Exception as e:
                 bt.logging.error(f"Error in update loop: {e}")
 
@@ -632,9 +642,14 @@ class Validator:
             7. Logs all relevant data for the step, including model IDs, pages, batches, wins, win rates, and losses.
         """
 
-        competition = constants.COMPETITION_SCHEDULE[
-            self.global_step % len(constants.COMPETITION_SCHEDULE)
-        ]
+        # Note that block on the metagraph only updates on sync operations.
+        # Therefore validators may not start evaluating on a new competition schedule immediately.
+        with self.metagraph_lock:
+            block = self.metagraph.block.item()
+        competition_schedule = competition_utils.get_competition_schedule_for_block(
+            block
+        )
+        competition = competition_schedule[self.global_step % len(competition_schedule)]
         bt.logging.info("Starting evaluation for competition: " + str(competition.id))
 
         # Add uids with newly updated models to the upcoming batch of evaluations.
@@ -690,7 +705,7 @@ class Validator:
         # Tokenize the data into batches for use in evaluation.
         # If custom tokenizers are allowed this will need to be done on a per uid basis instead.
         tokenizer = ft.model.load_tokenizer(
-            competition, cache_dir=self.config.model_dir
+            competition.constraints, cache_dir=self.config.model_dir
         )
         batches = cortex_data.tokenize(
             tokenizer, competition.constraints.sequence_length
@@ -828,15 +843,11 @@ class Validator:
         )
 
         # Get ids for all competitions in the schedule.
-        active_competition_ids = set(
-            [comp.id for comp in constants.COMPETITION_SCHEDULE]
-        )
+        active_competition_ids = set([comp.id for comp in competition_schedule])
         # Align competition_tracker to only track active competitions.
         self.competition_tracker.reset_competitions(active_competition_ids)
         # Update self.weights to the merged values across active competitions.
-        self.weights = self.competition_tracker.get_subnet_weights(
-            constants.COMPETITION_SCHEDULE
-        )
+        self.weights = self.competition_tracker.get_subnet_weights(competition_schedule)
 
         # Prioritize models for keeping up to the sample_min for the next eval loop.
         # If the model has any significant weight, prioritize by weight with greater weights being kept first.
@@ -1062,7 +1073,8 @@ class Validator:
         )
         with self.metagraph_lock:
             uids_to_competition_ids = {}
-            for uid in range(len(hotkey_to_metadata)):
+            # Check all uids currently registered as we default to None if they don't have metadata.
+            for uid in range(len(self.metagraph.uids)):
                 hotkey = self.metagraph.hotkeys[uid]
                 metadata = hotkey_to_metadata.get(hotkey, None)
                 uids_to_competition_ids[uid] = (

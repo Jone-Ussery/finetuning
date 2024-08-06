@@ -1,7 +1,7 @@
 import datetime as dt
 import math
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Tuple
 
 import torch
 from transformers import (
@@ -20,7 +20,7 @@ from competitions.data import Competition, CompetitionId, ModelConstraints
 # Project Constants.
 # ---------------------------------
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 version_split = __version__.split(".")
 __spec_version__ = (
     (1000 * int(version_split[0]))
@@ -43,7 +43,7 @@ CORTEX_SUBNET_UID = 18
 CORTEX_WANDB_PROJECT = "cortex-t/multi-modality"
 CORTEX_WANDB_TYPE = "validator"
 CORTEX_MAX_UIDS = 256
-CORTEX_MAX_AGE = dt.timedelta(days=1)
+CORTEX_MAX_AGE = dt.timedelta(hours=4)
 CORTEX_MIN_SCORE = 0.85
 # Minimum stake to get data from a cortex validator.
 CORTEX_MIN_STAKE = 100_000
@@ -54,36 +54,49 @@ WEIGHT_SYNC_VALI_MIN_STAKE = 100_000
 WEIGHT_SYNC_MINER_MIN_PERCENT = 0.10
 # The root directory of this project.
 ROOT_DIR = Path(__file__).parent.parent
-# The maximum bytes for the hugging face repo
+# The maximum bytes for the hugging face repo.
 MAX_HUGGING_FACE_BYTES: int = 15 * 1024 * 1024 * 1024
-# TODO: Adjust below to be done by block instead as in 9 with helpers.
-# Schedule of model architectures
-COMPETITION_SCHEDULE: List[Competition] = [
-    Competition(
-        id=CompetitionId.SN9_MODEL,
-        constraints=ModelConstraints(
-            max_model_parameter_size=6_900_000_000,
-            sequence_length=4096,
-            allowed_architectures=[
-                MistralForCausalLM,
-                LlamaForCausalLM,
-                BartForCausalLM,
-                FalconForCausalLM,
-                GPTNeoXForCausalLM,
-                PhiForCausalLM,
-                GemmaForCausalLM,
-            ],
-            tokenizer="Xenova/gpt-4",
-            kwargs={
-                "torch_dtype": torch.bfloat16,
-                "attn_implementation": "flash_attention_2",
-            },
-        ),
-        reward_percentage=1.0,
+# Defined model constraints by competition id to ensure they are constant across blocks.
+MODEL_CONSTRAINTS_BY_COMPETITION_ID: Dict[CompetitionId, ModelConstraints] = {
+    CompetitionId.SN9_MODEL: ModelConstraints(
+        max_model_parameter_size=6_900_000_000,
+        sequence_length=4096,
+        allowed_architectures=[
+            MistralForCausalLM,
+            LlamaForCausalLM,
+            BartForCausalLM,
+            FalconForCausalLM,
+            GPTNeoXForCausalLM,
+            PhiForCausalLM,
+            GemmaForCausalLM,
+        ],
+        tokenizer="Xenova/gpt-4",
+        kwargs={
+            "torch_dtype": torch.bfloat16,
+        },
+        eval_block_delay=1200,  # ~4 hours.
+    ),
+}
+
+# Schedule of competitions by block.
+COMPETITION_SCHEDULE_BY_BLOCK: List[Tuple[int, List[Competition]]] = [
+    (
+        0,
+        [
+            Competition(
+                CompetitionId.SN9_MODEL,
+                MODEL_CONSTRAINTS_BY_COMPETITION_ID[CompetitionId.SN9_MODEL],
+                1.0,
+            )
+        ],
     )
 ]
 
-assert math.isclose(sum(x.reward_percentage for x in COMPETITION_SCHEDULE), 1.0)
+for block_and_competitions in COMPETITION_SCHEDULE_BY_BLOCK:
+    assert math.isclose(
+        sum(competition.reward_percentage for competition in block_and_competitions[1]),
+        1.0,
+    )
 
 # ---------------------------------
 # Miner/Validator Model parameters.

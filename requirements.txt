@@ -1,5 +1,4 @@
 bittensor==6.9.3
-flash-attn==2.5.8
 huggingface_hub
 numpy==1.26.4
 python-dotenv
